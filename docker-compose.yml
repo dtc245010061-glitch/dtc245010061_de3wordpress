@@ -1,19 +1,45 @@
+# ==============================================================================
+# ĐỀ TÀI 3: WEBSITE QUẢNG BÁ SẢN PHẨM (WORDPRESS)
+# Hệ thống gồm 12 dịch vụ Container điều phối bằng Docker Compose
+# Môi trường: Ubuntu Server 24.04 LTS (IP: 192.168.184.130)
+# Sinh viên: Nguyễn Hà Nam - MSSV: DTC245010061
+# ==============================================================================
+
 version: '3.8'
 
+# ------------------------------------------------------------------------------
+# 1. PHÂN VÙNG MẠNG DOCKER (NETWORK ISOLATION)
+# Tách biệt 2 mạng bridge độc lập để đảm bảo an toàn thông tin
+# ------------------------------------------------------------------------------
 networks:
+  # Mạng tầng ứng dụng: Dành riêng cho Web (Nginx, WordPress), CSDL (MySQL, phpMyAdmin)
   app-network:
     driver: bridge
+  # Mạng tầng giám sát: Dành cho Prometheus, Grafana, Loki, Promtail và các Exporter
   monitoring:
     driver: bridge
 
+# ------------------------------------------------------------------------------
+# 2. KHAI BÁO VOLUME LƯU TRỮ BỀN VỮNG (PERSISTENT VOLUMES)
+# Đảm bảo dữ liệu không bị mất khi khởi động lại hoặc cập nhật container
+# ------------------------------------------------------------------------------
 volumes:
-  db_data:
-  wordpress_data:
-  prometheus_data:
-  grafana_data:
-  loki_data:
+  db_data:          # Lưu trữ dữ liệu cơ sở dữ liệu MySQL (/var/lib/mysql)
+  wordpress_data:   # Lưu trữ mã nguồn, mã tải lên và cấu hình WordPress (/var/www/html)
+  prometheus_data:  # Lưu trữ cơ sở dữ liệu chuỗi thời gian TSDB của Prometheus
+  grafana_data:     # Lưu trữ dữ liệu cấu hình, tài khoản và dashboard của Grafana
+  loki_data:        # Lưu trữ các khối log (chunks) và chỉ mục của Loki
 
+# ------------------------------------------------------------------------------
+# 3. DANH SÁCH 12 DỊCH VỤ CONTAINER (SERVICES)
+# ------------------------------------------------------------------------------
 services:
+
+  # ----------------------------------------------------------------------------
+  # [1] CƠ SỞ DỮ LIỆU MYSQL 8.0
+  # - Bảo mật: KHÔNG publish cổng 3306 ra host (chỉ truy cập nội bộ trong app-network)
+  # - Healthcheck: Đảm bảo CSDL thực sự sẵn sàng trước khi WordPress khởi động
+  # ----------------------------------------------------------------------------
   mysql:
     image: mysql:8.0
     container_name: mysql
@@ -33,12 +59,17 @@ services:
       timeout: 5s
       retries: 3
 
+  # ----------------------------------------------------------------------------
+  # [2] GIAO DIỆN QUẢN TRỊ CSDL PHPMYADMIN
+  # - Cho phép quản trị trực quan MySQL mà không cần mở cổng 3306 ra ngoài
+  # - Kết nối tới MySQL thông qua DNS nội bộ của Docker (PMA_HOST=mysql)
+  # ----------------------------------------------------------------------------
   phpmyadmin:
     image: phpmyadmin:5.2
     container_name: phpmyadmin
     restart: unless-stopped
     ports:
-      - "8082:80"
+      - "8082:80"    # Mở cổng 8082 ra máy chủ host để sinh viên/quản trị viên truy cập
     environment:
       PMA_HOST: mysql
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
@@ -47,6 +78,12 @@ services:
     networks:
       - app-network
 
+  # ----------------------------------------------------------------------------
+  # [3] MÁY CHỦ ỨNG DỤNG WORDPRESS
+  # - Ẩn cổng 80 nội bộ, toàn bộ traffic đi qua Nginx Reverse Proxy
+  # - WORDPRESS_CONFIG_EXTRA: Nhận diện HTTPS từ Nginx qua header X-Forwarded-Proto,
+  #   tự động sinh URL động và chống vòng lặp chuyển hướng (redirect loop)
+  # ----------------------------------------------------------------------------
   wordpress:
     image: wordpress:6.6.1-php8.3-apache
     container_name: wordpress
@@ -65,17 +102,23 @@ services:
       - wordpress_data:/var/www/html
     depends_on:
       mysql:
-        condition: service_healthy
+        condition: service_healthy    # Chờ MySQL khỏe mạnh mới khởi động WordPress
     networks:
       - app-network
 
+  # ----------------------------------------------------------------------------
+  # [4] NGINX REVERSE PROXY & BẢO MẬT HTTPS
+  # - Điểm tiếp nhận duy nhất cho toàn bộ traffic Web (cổng 80 và 443)
+  # - Chuyển hướng HTTP 301 sang HTTPS, giải mã SSL/TLS tự ký
+  # - Gắn các Security Headers (HSTS, X-Frame-Options, X-Content-Type-Options, v.v.)
+  # ----------------------------------------------------------------------------
   nginx:
     image: nginx:1.27-alpine
     container_name: nginx
     restart: unless-stopped
     ports:
-      - "80:80"
-      - "443:443"
+      - "80:80"      # Tiếp nhận HTTP và chuyển hướng sang 443
+      - "443:443"    # Tiếp nhận HTTPS bảo mật
     volumes:
       - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
       - ./nginx/certs:/etc/nginx/certs:ro
@@ -85,8 +128,13 @@ services:
       - wordpress
     networks:
       - app-network
-      - monitoring
+      - monitoring   # Thuộc cả 2 mạng để Blackbox-exporter có thể probe qua HTTPS
 
+  # ----------------------------------------------------------------------------
+  # [5] BLACKBOX EXPORTER (GIÁM SÁT ĐẦU CUỐI TẦNG ỨNG DỤNG)
+  # - Kiểm thử hộp đen (Probe HTTP/HTTPS) tới Nginx (443) và WordPress (80)
+  # - Giúp phát hiện lỗi tầng L7 (như lỗi 502 Bad Gateway khi WordPress tắt)
+  # ----------------------------------------------------------------------------
   blackbox-exporter:
     image: prom/blackbox-exporter:v0.25.0
     container_name: blackbox-exporter
@@ -99,8 +147,13 @@ services:
       - no-new-privileges:true
     networks:
       - monitoring
-      - app-network
+      - app-network   # Cầu nối mạng để probe dịch vụ ở cả app-network và monitoring
 
+  # ----------------------------------------------------------------------------
+  # [6] MYSQL EXPORTER (GIÁM SÁT CƠ SỞ DỮ LIỆU)
+  # - Đăng nhập vào MySQL bằng tài khoản exporter (chỉ cấp quyền SELECT tối thiểu)
+  # - Xuất các chỉ số hoạt động của CSDL (kết nối, truy vấn, trạng thái luồng)
+  # ----------------------------------------------------------------------------
   mysql-exporter:
     image: prom/mysqld-exporter:v0.15.1
     container_name: mysql-exporter
@@ -117,8 +170,13 @@ services:
       - no-new-privileges:true
     networks:
       - monitoring
-      - app-network
+      - app-network   # Cầu nối mạng để đọc metrics từ CSDL trong app-network
 
+  # ----------------------------------------------------------------------------
+  # [7] PROMETHEUS (MÁY CHỦ THU THẬP VÀ LƯU TRỮ METRICS)
+  # - Hoạt động theo mô hình Pull, định kỳ mỗi 15 giây kéo metrics từ 6 target
+  # - Lưu trữ dữ liệu chuỗi thời gian (TSDB) trong 7 ngày
+  # ----------------------------------------------------------------------------
   prometheus:
     image: prom/prometheus:v2.54.1
     container_name: prometheus
@@ -131,12 +189,17 @@ services:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus_data:/prometheus
     ports:
-      - "9090:9090"
+      - "9090:9090"  # Cổng giao diện web Prometheus
     security_opt:
       - no-new-privileges:true
     networks:
       - monitoring
 
+  # ----------------------------------------------------------------------------
+  # [8] GRAFANA (NỀN TẢNG TRỰC QUAN HÓA DASHBOARD)
+  # - Tự động nạp DataSource (Prometheus & Loki) và Dashboard "Monitoring Lab" (Provisioning as Code)
+  # - Cung cấp giao diện trực quan 6 panel theo dõi trạng thái hệ thống và truy vấn LogQL
+  # ----------------------------------------------------------------------------
   grafana:
     image: grafana/grafana:11.2.0
     container_name: grafana
@@ -150,7 +213,7 @@ services:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
       - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
     ports:
-      - "3000:3000"
+      - "3000:3000"  # Cổng giao diện web Grafana
     depends_on:
       - prometheus
     security_opt:
@@ -158,11 +221,16 @@ services:
     networks:
       - monitoring
 
+  # ----------------------------------------------------------------------------
+  # [9] CADVISOR (GIÁM SÁT TÀI NGUYÊN CONTAINER)
+  # - Đọc trực tiếp cgroups và thông tin runtime từ Docker daemon
+  # - Xuất thông số CPU, RAM, Network I/O chi tiết của từng container
+  # ----------------------------------------------------------------------------
   cadvisor:
     image: gcr.io/cadvisor/cadvisor:v0.49.1
     container_name: cadvisor
     restart: unless-stopped
-    privileged: true
+    privileged: true   # Ngoại lệ bảo mật: Cần quyền privileged để đọc thông tin sâu từ nhân Linux
     devices:
       - /dev/kmsg
     volumes:
@@ -174,6 +242,11 @@ services:
     networks:
       - monitoring
 
+  # ----------------------------------------------------------------------------
+  # [10] NODE EXPORTER (GIÁM SÁT TÀI NGUYÊN MÁY CHỦ HOST)
+  # - Mount các thư mục hệ thống /proc, /sys ở chế độ chỉ đọc (:ro)
+  # - Xuất các chỉ số phần cứng máy chủ Ubuntu (tải CPU, RAM, ổ đĩa, card mạng)
+  # ----------------------------------------------------------------------------
   node-exporter:
     image: prom/node-exporter:v1.8.2
     container_name: node-exporter
@@ -187,6 +260,12 @@ services:
     networks:
       - monitoring
 
+  # ----------------------------------------------------------------------------
+  # [11] GRAFANA LOKI (LƯU TRỮ VÀ CHỈ MỤC LOG TẬP TRUNG)
+  # - Tiếp nhận các luồng log (streams) từ Promtail theo mô hình Push
+  # - Đánh chỉ mục log theo metadata/labels (container, job, service)
+  # - Bảo mật: KHÔNG mở cổng 3100 ra host, chỉ giao tiếp nội bộ trong mạng monitoring
+  # ----------------------------------------------------------------------------
   loki:
     image: grafana/loki:2.9.8
     container_name: loki
@@ -200,6 +279,11 @@ services:
     networks:
       - monitoring
 
+  # ----------------------------------------------------------------------------
+  # [12] PROMTAIL (THU THẬP LOG TỪ CONTAINER DOCKER)
+  # - Mount docker.sock và thư mục /var/lib/docker/containers ở chế độ chỉ đọc (:ro)
+  # - Tự động phát hiện container mới, gắn nhãn (container, service) và đẩy về Loki
+  # ----------------------------------------------------------------------------
   promtail:
     image: grafana/promtail:3.0.0
     container_name: promtail
